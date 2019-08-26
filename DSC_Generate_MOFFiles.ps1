@@ -23,6 +23,55 @@ param(
         [string][Parameter(Mandatory=$true)] $ConfigFile = 'DSCConfig.ps1'
 )
 
+#https://gallery.technet.microsoft.com/scriptcenter/Test-Credential-dda902c6
+Function Test-Credential {
+    [OutputType([Bool])]
+    
+    Param (
+        [Parameter(
+            Mandatory = $true,
+            ValueFromPipeLine = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [Alias(
+            'PSCredential'
+        )]
+        [ValidateNotNull()]
+        [System.Management.Automation.PSCredential]
+        [System.Management.Automation.Credential()]
+        $Credential,
+
+        [Parameter()]
+        [String]
+        $Domain = $Credential.GetNetworkCredential().Domain
+    )
+
+    Begin {
+        [System.Reflection.Assembly]::LoadWithPartialName("System.DirectoryServices.AccountManagement") |
+            Out-Null
+
+        $principalContext = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+            [System.DirectoryServices.AccountManagement.ContextType]::Domain, $Domain
+        )
+    }
+
+    Process {
+        foreach ($item in $Credential) {
+            $networkCredential = $Credential.GetNetworkCredential()
+            
+            Write-Output -InputObject $(
+                $principalContext.ValidateCredentials(
+                    $networkCredential.UserName, $networkCredential.Password
+                )
+            )
+        }
+    }
+
+    End {
+        $principalContext.Dispose()
+    }
+}
+
 . "$PSScriptRoot\$ConfigFile"
 
 $ConfigData = "$PSScriptRoot\$ConfigDataFile"
@@ -32,6 +81,7 @@ $data = Invoke-Expression (Get-Content $ConfigData | out-string)
 $dscConfigPath = $data.NonNodeData.DSCConfig.DSCConfigPath + "\Configurations"
 
 #Delete all mof and checksum files as we will create new ones
+Write-Host "Removing all configurations files from $dscConfigPath"
 Get-ChildItem $dscConfigPath | where {!$_.PSISContainer} | Remove-Item
 
 $setupAccountName = $data.NonNodeData.SharePoint.ServiceAccounts.SetupAccount
@@ -42,12 +92,22 @@ $srcContentAccessAccount = $data.NonNodeData.SharePoint.ServiceAccounts.ContentA
 #$ConnectAccounts = $data.NonNodeData.SharePoint.ServiceAccounts.ConnectionAccount
 
 Write-Host "Getting Service Account Credentials" -ForegroundColor Green
-
-$SetupAccount = Get-Credential -UserName $setupAccountName -Message "Setup Account"
-$FarmAccount = Get-Credential  -UserName $farmAccountName -Message "Farm Account"
-$WebAppPoolAccount = Get-Credential -UserName $webAppAccountName -Message "Web App Pool Account"
-$ServicePoolAccount = Get-Credential -UserName $svcAppAccountName -Message "Svc App Pool Account"
-$ContentAccessAccount = Get-Credential -UserName $srcContentAccessAccount -Message "Search Default Content Access Account"
+$Domain = $data.NonNodeData.DomainDetails.DomainName
+Do {
+    $SetupAccount = Get-Credential -UserName $setupAccountName -Message "Setup Account"
+}While ((Test-Credential -Credential $SetupAccount -Domain $Domain) -eq $false)
+Do {
+    $FarmAccount = Get-Credential  -UserName $farmAccountName -Message "Farm Account"
+}While ((Test-Credential -Credential $FarmAccount -Domain $Domain) -eq $false)
+Do {
+    $WebAppPoolAccount = Get-Credential -UserName $webAppAccountName -Message "Web App Pool Account"
+}While ((Test-Credential -Credential $WebAppPoolAccount -Domain $Domain) -eq $false)
+Do {
+    $ServicePoolAccount = Get-Credential -UserName $svcAppAccountName -Message "Svc App Pool Account"
+}While ((Test-Credential -Credential $ServicePoolAccount -Domain $Domain) -eq $false)
+Do {
+    $ContentAccessAccount = Get-Credential -UserName $srcContentAccessAccount -Message "Search Default Content Access Account"
+}While ((Test-Credential -Credential $ContentAccessAccount -Domain $Domain) -eq $false)
 $passPhrase = Get-Credential -Message "Farm PassPhrase" -UserName "PassPhrase"
 <#
 if ($ConfigurationData.NonNodeData.SharePoint.Version -eq 2013)
@@ -64,11 +124,12 @@ if ($ConfigurationData.NonNodeData.SharePoint.Version -eq 2013)
 
 Write-Host "Generating DSC Configuration into " $dscConfigPath -ForegroundColor Green
 
-SharePointServer -FarmAccount $FarmAccount -WebPoolManagedAccount $WebAppPoolAccount -SPSetupAccount $SetupAccount -ServicePoolManagedAccount $ServicePoolAccount -ContentAccessAccount $ContentAccessAccount -outputpath $dscConfigPath -ConfigurationData $ConfigData -UPASyncConnectAccounts $ConnectAccount -PassPhrase $passPhrase   
+SharePointServer -FarmAccount $FarmAccount -WebPoolManagedAccount $WebAppPoolAccount -SPSetupAccount $SetupAccount -ServicePoolManagedAccount $ServicePoolAccount -ContentAccessAccount $ContentAccessAccount -outputpath $dscConfigPath -ConfigurationData $ConfigData -PassPhrase $passPhrase # -UPASyncConnectAccounts $ConnectAccount   
 
 Write-Host "Creating checksums for all MOF..." -ForegroundColor Green
 New-DSCCheckSum -Path $dscConfigPath -Force
 <#
+#Will need to find another value other than minrole
 Write-Host "Removing old MOF from client servers" -ForegroundColor green
 $data.AllNodes | ?{$_.MinRole} | ForEach-Object {
     $ServerCIMSession = New-CimSession -ComputerName $_.NodeName -Credential $SetupAccount
